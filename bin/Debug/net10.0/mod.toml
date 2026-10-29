@@ -1,0 +1,9 @@
+name = "Telemetry Overlay - Browser integration"
+
+[StarMap]
+EntryAssembly = "BrowserServerModule"
+
+[[StarMap.ModDependencies]]
+ModId = "KSATelemetryOverlay"
+Optional = false
+ImportedAssemblies = [ "KSATelemetryOverlay" ]

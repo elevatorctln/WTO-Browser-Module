@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "BrowserServerModule/1.1.0": {
+        "runtime": {
+          "BrowserServerModule.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "BrowserServerModule/1.1.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
