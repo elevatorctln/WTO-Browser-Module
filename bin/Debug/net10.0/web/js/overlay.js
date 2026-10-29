@@ -6,6 +6,68 @@
 
     const canvas = document.getElementById('overlay-canvas');
     const ctx = canvas.getContext('2d');
+    let videoWs = null;
+    let latestVideoFrame = null;
+    let isVideoActive = false;
+
+    // High performance asynchronous JPEG WebSocket receiver
+    function connectVideo() {
+        if (videoWs) {
+            try { videoWs.close(); } catch (_) { }
+            videoWs = null;
+        }
+
+        let host = location.host;
+        if (!host || location.protocol === 'file:') {
+            host = '127.0.0.1:8088';
+        }
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${host}/video-ws`;
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'blob';
+
+        ws.onopen = function () {
+            console.log('[OBS Overlay] Connected to KSA video stream WebSocket');
+        };
+
+        ws.onmessage = async function (event) {
+            if (!isVideoActive) return;
+            try {
+                const blob = event.data;
+                const bmp = await createImageBitmap(blob);
+                const oldBmp = latestVideoFrame;
+                latestVideoFrame = bmp;
+                if (oldBmp) {
+                    oldBmp.close();
+                }
+            } catch (err) {
+                console.error('[OBS Overlay] Video decode error:', err);
+            }
+        };
+
+        ws.onclose = function () {
+            if (isVideoActive) {
+                setTimeout(connectVideo, 1000);
+            }
+        };
+
+        ws.onerror = function () {
+            try { ws.close(); } catch (_) { }
+        };
+
+        videoWs = ws;
+    }
+
+    function disconnectVideo() {
+        if (videoWs) {
+            try { videoWs.close(); } catch (_) { }
+            videoWs = null;
+        }
+        if (latestVideoFrame) {
+            try { latestVideoFrame.close(); } catch (_) { }
+            latestVideoFrame = null;
+        }
+    }
 
     // Reference design resolution (1080p standard OBS canvas)
     const REF_WIDTH = 1920;
@@ -85,7 +147,8 @@
         speedArcFullScale: 7800.0,
         altitudeArcFullScaleKm: 100.0,
         gForceArcFullScale: 6.0,
-        engineDiagramRotation: 0.0
+        engineDiagramRotation: 0.0,
+        streamGameVideo: false
     };
 
     // Smoothed values for frame rate-independent 60 FPS animation
@@ -880,6 +943,11 @@
         ctx.scale(dpr, dpr);
         ctx.clearRect(0, 0, width, height);
 
+        // Hardware-decoded clean game video feed drawn directly to canvas
+        if (isVideoActive && latestVideoFrame) {
+            ctx.drawImage(latestVideoFrame, 0, 0, width, height);
+        }
+
         const scale = (height / REF_HEIGHT) * (telemetry.scale || 0.83);
         const opacity = Math.max(0.1, Math.min(telemetry.opacity != null ? telemetry.opacity : 1.0, 1.0));
 
@@ -1111,8 +1179,20 @@
                     speedArcFullScale: packet.SpeedArcFullScale ?? packet.speedArcFullScale ?? 7800.0,
                     altitudeArcFullScaleKm: packet.AltitudeArcFullScaleKm ?? packet.altitudeArcFullScaleKm ?? 100.0,
                     gForceArcFullScale: packet.GForceArcFullScale ?? packet.gForceArcFullScale ?? 6.0,
-                    engineDiagramRotation: packet.EngineDiagramRotation ?? packet.engineDiagramRotation ?? 0.0
+                    engineDiagramRotation: packet.EngineDiagramRotation ?? packet.engineDiagramRotation ?? 0.0,
+                    streamGameVideo: Boolean(packet.StreamGameVideo ?? packet.streamGameVideo)
                 };
+
+                // Reactive game video layer management
+                const shouldStream = telemetry.streamGameVideo;
+                if (shouldStream !== isVideoActive) {
+                    isVideoActive = shouldStream;
+                    if (isVideoActive) {
+                        connectVideo();
+                    } else {
+                        disconnectVideo();
+                    }
+                }
             } catch (err) {
                 console.error('[OBS Overlay] Error parsing telemetry packet:', err);
             }
@@ -1120,6 +1200,10 @@
 
         ws.onclose = function () {
             connected = false;
+            if (isVideoActive) {
+                isVideoActive = false;
+                disconnectVideo();
+            }
             setTimeout(connect, 1000);
         };
 

@@ -58,6 +58,7 @@ public sealed class TelemetryPacket
     public float AltitudeArcFullScaleKm { get; set; } = 100f;
     public float GForceArcFullScale { get; set; } = 6f;
     public float EngineDiagramRotation { get; set; } = 0f;
+    public bool StreamGameVideo { get; set; } = false;
 }
 
 public sealed class EnginePacket

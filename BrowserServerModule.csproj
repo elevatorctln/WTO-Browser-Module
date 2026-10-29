@@ -26,15 +26,20 @@
 		</None>
 	</ItemGroup>
 
-	<ItemGroup>
-		<ProjectReference Include="..\KSATelemetryOverlay.csproj">
+	<ItemGroup Condition="Exists('..\KSATelemetryOverlay\KSATelemetryOverlay.csproj')">
+		<ProjectReference Include="..\KSATelemetryOverlay\KSATelemetryOverlay.csproj">
 			<Private>false</Private>
 		</ProjectReference>
 	</ItemGroup>
+	<ItemGroup Condition="!Exists('..\KSATelemetryOverlay\KSATelemetryOverlay.csproj') and Exists('$(ImportDir)KSATelemetryOverlay.dll')">
+		<Reference Include="$(ImportDir)KSATelemetryOverlay.dll">
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
 
 	<PropertyGroup>
-		<ImportDir Condition="'$(ImportDir)' == ''">$(MSBuildThisFileDirectory)..\..\Import\</ImportDir>
-		<ImportDir Condition="!Exists('$(ImportDir)')">$(MSBuildThisFileDirectory)..\Import\</ImportDir>
+		<ImportDir Condition="'$(ImportDir)' == ''">$(MSBuildThisFileDirectory)..\Import\</ImportDir>
+		<ImportDir Condition="!Exists('$(ImportDir)')">$(MSBuildThisFileDirectory)..\..\Import\</ImportDir>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -72,6 +77,18 @@
 			<Private>false</Private>
 		</Reference>
 		<Reference Include="$(ImportDir)StarMap.API.dll">
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="$(ImportDir)0Harmony.dll">
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="$(ImportDir)Brutal.Vulkan.dll">
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="$(ImportDir)Brutal.Vulkan.Abstractions.dll">
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="$(ImportDir)Planet.Render.Core.dll">
 			<Private>false</Private>
 		</Reference>
 	</ItemGroup>

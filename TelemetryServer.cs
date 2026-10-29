@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Channels;
 using KSATelemetryOverlay;
 using KSATelemetryOverlay.Config;
 using KSATelemetryOverlay.Telemetry;
@@ -25,6 +26,9 @@ public sealed class TelemetryServer : IDisposable
 
     private readonly ConcurrentDictionary<WebSocket, byte> _sockets = new();
     private readonly ConcurrentDictionary<WebSocket, int> _sendingFlags = new();
+    private static readonly ConcurrentDictionary<VideoStreamClient, byte> _videoClients = new();
+    private static readonly ConcurrentDictionary<WebSocket, byte> _videoSockets = new();
+    private static readonly ConcurrentDictionary<WebSocket, int> _videoSendingFlags = new();
     private readonly System.Diagnostics.Stopwatch _broadcastTimer = System.Diagnostics.Stopwatch.StartNew();
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -43,6 +47,83 @@ public sealed class TelemetryServer : IDisposable
     public bool IsRunning => _listener is not null;
     public int ConnectedClients => _sockets.Count;
     public int Port => _boundPort;
+    public static bool HasVideoClients => !_videoClients.IsEmpty || !_videoSockets.IsEmpty;
+    public static int VideoClientCount => _videoClients.Count + _videoSockets.Count;
+
+    public static void BroadcastVideoFrame(byte[] jpegBytes)
+    {
+        if (jpegBytes == null || jpegBytes.Length == 0)
+        {
+            return;
+        }
+
+        if (!_videoClients.IsEmpty)
+        {
+            foreach (VideoStreamClient client in _videoClients.Keys)
+            {
+                client.Writer.TryWrite(jpegBytes);
+            }
+        }
+
+        if (!_videoSockets.IsEmpty)
+        {
+            foreach (WebSocket ws in _videoSockets.Keys)
+            {
+                if (ws.State == WebSocketState.Open)
+                {
+                    _ = SendVideoFrameToSocketAsync(ws, jpegBytes);
+                }
+                else
+                {
+                    RemoveVideoSocket(ws);
+                }
+            }
+        }
+    }
+
+    private static async Task SendVideoFrameToSocketAsync(WebSocket ws, byte[] bytes)
+    {
+        // Drop intermediate frame if previous frame send is still in flight (keeps video 100% real-time)
+        if (!_videoSendingFlags.TryUpdate(ws, 1, 0))
+        {
+            return;
+        }
+
+        try
+        {
+            if (ws.State == WebSocketState.Open)
+            {
+                await ws.SendAsync(
+                    new ArraySegment<byte>(bytes),
+                    WebSocketMessageType.Binary,
+                    endOfMessage: true,
+                    CancellationToken.None);
+            }
+        }
+        catch
+        {
+            RemoveVideoSocket(ws);
+        }
+        finally
+        {
+            _videoSendingFlags.TryUpdate(ws, 0, 1);
+        }
+    }
+
+    private static void RemoveVideoSocket(WebSocket ws)
+    {
+        _videoSockets.TryRemove(ws, out _);
+        _videoSendingFlags.TryRemove(ws, out _);
+        try
+        {
+            if (ws.State == WebSocketState.Open)
+            {
+                ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+            }
+            ws.Dispose();
+        }
+        catch { }
+    }
 
     public string StatusText
     {
@@ -59,7 +140,9 @@ public sealed class TelemetryServer : IDisposable
             }
 
             int count = ConnectedClients;
-            return $"Running on http://127.0.0.1:{_boundPort}/ ({count} client{(count == 1 ? "" : "s")})";
+            int vCount = VideoClientCount;
+            string vInfo = vCount > 0 ? $", {vCount} video" : "";
+            return $"Running on http://127.0.0.1:{_boundPort}/ ({count} overlay{vInfo})";
         }
     }
 
@@ -179,6 +262,24 @@ public sealed class TelemetryServer : IDisposable
         }
         _sockets.Clear();
         _sendingFlags.Clear();
+
+        foreach (VideoStreamClient videoClient in _videoClients.Keys)
+        {
+            videoClient.Cancel();
+        }
+        _videoClients.Clear();
+
+        foreach (WebSocket ws in _videoSockets.Keys)
+        {
+            try
+            {
+                ws.Dispose();
+            }
+            catch { }
+        }
+        _videoSockets.Clear();
+        _videoSendingFlags.Clear();
+
         _boundPort = 0;
         Console.WriteLine(LogPrefix + "stopped");
     }
@@ -391,6 +492,7 @@ public sealed class TelemetryServer : IDisposable
             AltitudeArcFullScaleKm = config.AltitudeArcFullScaleKm,
             GForceArcFullScale = config.GForceArcFullScale,
             EngineDiagramRotation = config.EngineDiagramRotation,
+            StreamGameVideo = config.StreamGameVideo,
         };
     }
 
@@ -401,6 +503,7 @@ public sealed class TelemetryServer : IDisposable
             try
             {
                 TcpClient client = await listener.AcceptTcpClientAsync(ct);
+                client.NoDelay = true;
                 _ = Task.Run(() => HandleClientAsync(client, ct), ct);
             }
             catch (OperationCanceledException)
@@ -448,13 +551,34 @@ public sealed class TelemetryServer : IDisposable
                     }
                 }
 
+                int qIdx = url.IndexOf('?');
+                string cleanPath = qIdx >= 0 ? url.Substring(0, qIdx) : url;
+
                 // Handle WebSocket upgrade
                 if (string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase) &&
                     headers.TryGetValue("Upgrade", out string? upgrade) &&
                     string.Equals(upgrade, "websocket", StringComparison.OrdinalIgnoreCase) &&
                     headers.TryGetValue("Sec-WebSocket-Key", out string? secKey))
                 {
-                    await UpgradeWebSocketAsync(stream, secKey, ct);
+                    if (cleanPath.Equals("/video-ws", StringComparison.OrdinalIgnoreCase) ||
+                        cleanPath.Equals("/vws", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await UpgradeVideoWebSocketAsync(stream, secKey, ct);
+                    }
+                    else
+                    {
+                        await UpgradeWebSocketAsync(stream, secKey, ct);
+                    }
+                    return;
+                }
+
+                // Handle MJPEG video stream
+                if (string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase) &&
+                    (cleanPath.Equals("/stream", StringComparison.OrdinalIgnoreCase) ||
+                     cleanPath.Equals("/stream.mjpg", StringComparison.OrdinalIgnoreCase) ||
+                     cleanPath.Equals("/video", StringComparison.OrdinalIgnoreCase)))
+                {
+                    await ServeMjpegStreamAsync(stream, ct);
                     return;
                 }
 
@@ -534,6 +658,58 @@ public sealed class TelemetryServer : IDisposable
         {
             RemoveSocket(ws);
             Console.WriteLine(LogPrefix + $"client disconnected (remaining: {_sockets.Count})");
+        }
+    }
+
+    private async Task UpgradeVideoWebSocketAsync(NetworkStream stream, string secKey, CancellationToken ct)
+    {
+        string acceptKey;
+        using (var sha1 = SHA1.Create())
+        {
+            byte[] hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+            acceptKey = Convert.ToBase64String(hash);
+        }
+
+        string responseHeaders = "HTTP/1.1 101 Switching Protocols\r\n" +
+                                 "Upgrade: websocket\r\n" +
+                                 "Connection: Upgrade\r\n" +
+                                 $"Sec-WebSocket-Accept: {acceptKey}\r\n\r\n";
+
+        byte[] headerBytes = Encoding.ASCII.GetBytes(responseHeaders);
+        await stream.WriteAsync(headerBytes, ct);
+        await stream.FlushAsync(ct);
+
+        WebSocket ws = WebSocket.CreateFromStream(stream, isServer: true, subProtocol: null, TimeSpan.FromSeconds(30));
+        _videoSockets[ws] = 1;
+        _videoSendingFlags[ws] = 0;
+
+        Console.WriteLine(LogPrefix + $"video client connected via WebSocket (active video: {VideoClientCount})");
+
+        byte[] buffer = new byte[1024];
+        try
+        {
+            while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
+            {
+                var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    try
+                    {
+                        if (ws.State == WebSocketState.CloseReceived)
+                        {
+                            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Closing", ct);
+                        }
+                    }
+                    catch { }
+                    break;
+                }
+            }
+        }
+        catch { }
+        finally
+        {
+            RemoveVideoSocket(ws);
+            Console.WriteLine(LogPrefix + $"video client disconnected (remaining video: {VideoClientCount})");
         }
     }
 
@@ -678,6 +854,85 @@ public sealed class TelemetryServer : IDisposable
         }
 
         return Path.GetFullPath(candidate);
+    }
+
+    private async Task ServeMjpegStreamAsync(NetworkStream stream, CancellationToken ct)
+    {
+        using var client = new VideoStreamClient();
+        _videoClients[client] = 1;
+        Console.WriteLine(LogPrefix + $"video stream client connected (active video: {_videoClients.Count})");
+
+        try
+        {
+            string header = "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: multipart/x-mixed-replace; boundary=--frame\r\n" +
+                            "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                            "Pragma: no-cache\r\n" +
+                            "Connection: close\r\n" +
+                            "Access-Control-Allow-Origin: *\r\n\r\n";
+            byte[] headerBytes = Encoding.ASCII.GetBytes(header);
+            await stream.WriteAsync(headerBytes, ct);
+            await stream.FlushAsync(ct);
+
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, client.CancellationToken);
+            var token = linkedCts.Token;
+
+            byte[] crlf = "\r\n"u8.ToArray();
+
+            while (await client.Reader.WaitToReadAsync(token))
+            {
+                while (client.Reader.TryRead(out byte[]? frame))
+                {
+                    if (frame is null || frame.Length == 0) continue;
+
+                    string frameHeader = $"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {frame.Length}\r\n\r\n";
+                    byte[] frameHeaderBytes = Encoding.ASCII.GetBytes(frameHeader);
+
+                    await stream.WriteAsync(frameHeaderBytes, token);
+                    await stream.WriteAsync(frame, token);
+                    await stream.WriteAsync(crlf, token);
+                    await stream.FlushAsync(token);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            #if DEBUG
+            Console.WriteLine(LogPrefix + $"video stream client exception: {ex.Message}");
+            #endif
+        }
+        finally
+        {
+            _videoClients.TryRemove(client, out _);
+            Console.WriteLine(LogPrefix + $"video stream client disconnected (remaining video: {_videoClients.Count})");
+        }
+    }
+
+    private sealed class VideoStreamClient : IDisposable
+    {
+        private readonly Channel<byte[]> _channel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(1)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false,
+        });
+        private readonly CancellationTokenSource _cts = new();
+
+        public ChannelWriter<byte[]> Writer => _channel.Writer;
+        public ChannelReader<byte[]> Reader => _channel.Reader;
+        public CancellationToken CancellationToken => _cts.Token;
+
+        public void Cancel()
+        {
+            try { _cts.Cancel(); } catch { }
+        }
+
+        public void Dispose()
+        {
+            Cancel();
+            _cts.Dispose();
+        }
     }
 
     public void Dispose()
